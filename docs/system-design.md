@@ -193,16 +193,22 @@ Only the HTTP path uses `MediaInferenceService`.
 
 ## Request flow — `POST /v1/chat/completions`
 
+One chat request at a time: the gate is taken after validation and held across
+model load *and* the entire generation. All blocking MLX work runs on the single
+chat worker thread.
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Client
     participant M as LoggingMiddleware
     participant R as routes_openai.py
-    participant G as chat gate<br/>(api/concurrency.py)
-    participant T as InferenceService<br/>(mlx-lm)
-    participant V as MediaInferenceService<br/>(mlx-vlm)
-    participant H as Exception handlers<br/>(app/main.py)
+    participant G as chat gate<br/>api/concurrency.py
+    participant W as chat worker thread<br/>run_chat · aiter_chat
+    participant MM as ModelManager
+    participant T as InferenceService<br/>mlx-lm
+    participant V as MediaInferenceService<br/>mlx-vlm
+    participant H as Exception handlers<br/>app/main.py
 
     C->>M: POST /v1/chat/completions
     M->>M: set correlation_id + request_id<br/>log request (media summarized)
@@ -211,45 +217,169 @@ sequenceDiagram
     R->>R: parse OpenAIChatCompletionRequest
     R->>R: _reject_unsupported_chat_features() → 400
     R->>R: _reject_unsupported_media_inputs() → 400
+    R->>R: _normalize_stop_sequences()
+    Note over R: Validation runs BEFORE the gate,<br/>so a malformed request never queues
 
     R->>G: acquire_chat_gate(chat_queue_timeout_seconds)
-    alt another chat still generating
+    alt still held when the timeout expires
         G--)R: TimeoutError
         R-->>C: 503 server busy
-    else gate acquired
-        G-->>R: held through load + generation
+    else acquired
+        G-->>R: held across load AND generation
     end
 
+    Note over R,V: Backend selection — the two are mutually exclusive
     alt _request_uses_vlm(messages) or _model_is_vlm(model)
-        R->>T: unload (one model at a time)
-        R->>V: _ensure_media_model_loaded()
-        V-->>R: loaded handle
+        R->>W: run_chat(_ensure_media_model_loaded)
+        W->>MM: ensure_model_files_ready(name)
+        MM-->>W: ModelInfo · 404 not found · 400 bad path · 500 load failed
+        W->>T: unload() the text backend
+        W->>V: load()
+        W-->>R: resident
     else text request
-        R->>V: unload (one model at a time)
-        R->>T: _ensure_model_loaded()
-        T-->>R: loaded handle
+        R->>W: run_chat(_ensure_model_loaded)
+        W->>MM: ensure_model_loadable(name)
+        MM-->>W: ModelInfo · 404 not found · 400 bad path or unsupported · 500 load failed
+        W->>V: unload() the media backend
+        W->>T: load()
+        W-->>R: resident
     end
-
-    Note over T,V: Generation below goes to whichever backend was selected<br/>above — both expose the same LoadedModelService interface
+    Note over T,V: Generation goes to whichever backend was selected —<br/>both expose the same LoadedModelService interface
 
     alt stream = false
-        R->>T: chat()
-        T-->>R: (text, usage)
-        R->>R: _split_at_stop_sequence()
-        R-->>C: OpenAIChatCompletionResponse<br/>(+ x_metrics if verbose)
+        R->>W: run_chat(chat) or run_chat(_collect_chat_completion)
+        W->>T: generate — drained per token when verbose or stop is set
+        T-->>W: text + usage
+        W-->>R: text + usage
+        R-->>C: 200 OpenAIChatCompletionResponse<br/>(+ x_metrics when verbose)
+        R->>G: release — the route's finally
     else stream = true
-        R->>T: chat_stream() — pumped via aiter_chat()
-        loop per token
-            T-->>R: delta
+        R-->>C: first chunk — delta.role = assistant
+        loop per token, pumped by aiter_chat()
+            R->>W: next() on _stream_with_stop_sequences(chat_stream())
+            W->>T: step
+            T-->>W: delta
+            W-->>R: delta, trimmed at the first stop match
             R-->>C: data: {chunk}
+            opt request.is_disconnected()
+                R->>W: close() the generator on the same thread
+            end
         end
-        R-->>C: data: [DONE]<br/>(x_metrics on final chunk if verbose)
+        opt stream_options.include_usage
+            R-->>C: usage chunk — empty choices
+        end
+        R-->>C: data: [DONE]<br/>(x_metrics on the final chunk when verbose)
+        R->>G: release — the SSE generator's finally,<br/>which also fires on disconnect
     end
-
-    R->>G: release (the SSE generator's finally when streaming)
 
     Note over R,H: Failure BEFORE the response starts →<br/>handlers in app/main.py log once + map to HTTP
     Note over R: Failure MID-SSE → the stream generator is the<br/>boundary: logs with exc_info, emits error frame + [DONE]
+```
+
+## Request flow — `/v1/audio/*`
+
+Audio never blocks the event loop and never queues behind chat: every call is
+handed to the shared Starlette threadpool, so transcriptions and syntheses run
+in parallel with each other and with a chat generation. A request **never
+downloads** — `task audio:setup` is the only fetch path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant M as LoggingMiddleware
+    participant R as routes_audio.py
+    participant P as Starlette threadpool<br/>shared — audio runs in parallel
+    participant A as AudioService
+    participant S as STT slot<br/>_ResidentModel
+    participant K as TTS slot<br/>_ResidentModel
+    participant H as Exception handlers<br/>app/main.py
+
+    C->>M: GET /v1/audio/models · POST /v1/audio/transcriptions · POST /v1/audio/speech
+    M->>M: set correlation_id + request_id, log request
+    M->>R: forward
+
+    alt GET /v1/audio/models
+        R->>A: describe_stt() + describe_tts()
+        A-->>R: repos · readiness · accepts_language_hint · voices · lang codes · speed range
+        Note over A: Filesystem only — loads nothing,<br/>so a frontend can poll it on page load
+        R-->>C: 200 AudioCapabilitiesResponse
+
+    else POST /v1/audio/transcriptions
+        R->>R: spool the upload to a NamedTemporaryFile<br/>suffix from filename, default .webm
+        R->>P: run_in_threadpool(transcribe)
+        P->>A: transcribe(path, language, model)
+        A->>A: _resolve_stt_model() — not in STT_MODELS → 400
+        A->>A: _stt_backend_for(repo_id) → whisper or parakeet
+        A->>S: acquire(repo_id, loader)
+        Note over S: same repo resident → straight through, runs in parallel<br/>different repo → wait for in-flight to drain, then swap
+        S->>S: _ensure_speech_model_available()<br/>offline cache probe → 503 when absent
+        S-->>A: handle + snapshot path
+        alt whisper
+            A->>A: mlx_whisper.transcribe(path, snapshot, language)
+        else parakeet
+            A->>A: handle.generate(path, chunked)<br/>language hint dropped — takes none
+        end
+        A-->>P: text
+        P-->>R: text
+        R->>R: remove the temp file — finally, runs on every path
+        R-->>C: 200 TranscriptionResponse
+
+    else POST /v1/audio/speech
+        R->>R: response_format other than wav → 400
+        R->>P: run_in_threadpool(synthesize)
+        P->>A: synthesize(input, voice, speed, lang_code)
+        A->>A: empty input → 500 InferenceError
+        A->>A: lang_code outside Kokoro's set → 400
+        A->>K: acquire(TTS_MODEL, _ensure_tts_loaded)
+        K->>K: _ensure_speech_model_available() → 503<br/>_configure_espeak() · patch_interpolate_ceil_drift()
+        K-->>A: kokoro + snapshot path
+        A->>A: voices/NAME.safetensors missing?<br/>others cached → 400 bad voice · none cached → 503 re-run setup
+        A->>A: kokoro.generate() → float32 chunks + sample rate
+        A-->>P: samples + sample_rate
+        P-->>R: samples + sample_rate
+        R->>R: soundfile.write(buffer, format=WAV)
+        R-->>C: 200 audio/wav bytes
+    end
+
+    Note over S,K: On release each slot re-arms its idle timer — after<br/>stt/tts_idle_timeout_seconds with nothing in flight, the model is dropped
+    Note over R,H: Domain exceptions are mapped to HTTP in the route —<br/>anything else reaches app/main.py, logged once as 500
+```
+
+## Audio slot residency — parallel vs swap
+
+Why a shared threadpool is safe: `_ResidentModel` decides per request whether to
+run straight through or wait. Same model → concurrent. Different model → the
+swap blocks until the in-flight requests finish, so a handle is never pulled out
+from under a running generate.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Client A — whisper
+    participant B as Client B — whisper
+    participant D as Client C — parakeet
+    participant S as STT slot
+
+    A->>S: acquire(whisper)
+    S->>S: slot empty → load whisper<br/>in_flight = 1
+    B->>S: acquire(whisper)
+    S->>S: already resident → no load<br/>in_flight = 2
+    Note over A,S: Both hold the same handle — the lock guards<br/>load/unload only, never generation
+    par Client A generates
+        A->>A: transcribe
+    and Client B generates
+        B->>B: transcribe
+    end
+
+    D->>S: acquire(parakeet)
+    S->>S: different repo AND in_flight > 0<br/>→ Condition.wait()
+    Note over D,S: The swap is what waits — the two whisper<br/>requests are never interrupted
+
+    A-->>S: done → in_flight = 1, notify_all()
+    B-->>S: done → in_flight = 0, notify_all()
+    S->>S: wakes, in_flight == 0 → release whisper<br/>(clears mlx_whisper ModelHolder), load parakeet
+    S-->>D: handle + snapshot path
 ```
 
 ## Model lifecycle

@@ -36,7 +36,7 @@ class MediaChatSession:
         image_path: Optional[Path] = None,
         audio_path: Optional[Path] = None,
         allowed_modalities: Optional[Sequence[str]] = None,
-        max_tokens: int = 256,
+        max_tokens: int = 10000,
         temperature: float = 0.0,
         system_prompt: Optional[str] = None,
         verbose: bool = False,
